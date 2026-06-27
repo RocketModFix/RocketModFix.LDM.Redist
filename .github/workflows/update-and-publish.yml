@@ -35,6 +35,7 @@ jobs:
     permissions:
       contents: write   # commit the refreshed assemblies + nuspec
       id-token: write   # OIDC Trusted Publishing
+      packages: write   # best-effort GitHub Packages mirror
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -139,6 +140,20 @@ jobs:
           nuspec_path: ${{ env.NUSPEC }}
           nuget_key: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
           nuget_push: true
+
+      # Best-effort mirror to GitHub Packages; nuget.org above is the primary. Its NuGet
+      # feed needs auth even to restore, so this is a backup, not the main source.
+      - name: Mirror to GitHub Packages
+        if: steps.decide.outputs.publish == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          dotnet nuget push *.nupkg \
+            --source "https://nuget.pkg.github.com/${OWNER}/index.json" \
+            --api-key "$GH_TOKEN" --skip-duplicate
 
       # Record what we published AFTER the push succeeds: if the push fails the repo
       # stays unchanged and the next run retries; a duplicate would fail loudly.
