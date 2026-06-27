@@ -2,7 +2,7 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd">
   <metadata>
     <id>RocketModFix.LDM.Redist</id>
-    <version>0.0.0</version>
+    <version>4.9.3.18</version>
     <title>Official Rocket (LDM) Redistributable</title>
     <description>
       The official Rocket (Legally Distinct Missile) assemblies — Rocket.API, Rocket.Core, Rocket.Unturned — for Unturned plugin development. Standalone and always up-to-date. Zero dependencies by design: bring your own Unturned redist (Assembly-CSharp, Steamworks.NET, SDG.NetTransport) and UnityEngine redist.
