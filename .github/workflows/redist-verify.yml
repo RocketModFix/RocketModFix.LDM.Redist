@@ -1,0 +1,107 @@
+name: "Redist Verify"
+
+# Validates an automated redist-update PR (files, hashes, no version downgrade), then
+# optionally auto-approves + auto-merges. Uses `pull_request` (not _target): runs only
+# PR-supplied data, and auto-merge is gated on the trusted bot author (a fork can't spoof).
+
+on:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'assemblies/**'
+      - '*.nuspec'
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+env:
+  NUSPEC: "RocketModFix.LDM.Redist.nuspec"
+
+jobs:
+  verify:
+    name: "Verify LDM redist update"
+    runs-on: ubuntu-latest
+    env:
+      ALLOW_AUTO_MERGE_REDIST_PR: ${{ vars.ALLOW_AUTO_MERGE_REDIST_PR }}
+    permissions:
+      pull-requests: write
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Only handle automated redist-update branches
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_HEAD_REF}" != redist-update/* ]]; then
+            echo "::error::This validator only handles 'redist-update/*' branches (got '${GITHUB_HEAD_REF}')."
+            exit 1
+          fi
+
+      - name: Validate required assemblies
+        run: |
+          set -euo pipefail
+          missing=()
+          for f in Rocket.API.dll Rocket.Core.dll Rocket.Unturned.dll manifest.sha256.json; do
+            if [ -f "assemblies/$f" ]; then echo "✅ assemblies/$f"; else echo "❌ assemblies/$f"; missing+=("$f"); fi
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::Missing required files: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Validate file hashes against manifest.sha256.json
+        run: |
+          set -euo pipefail
+          echo "🔒 Verifying SHA-256 of each DLL against assemblies/manifest.sha256.json..."
+          (
+            cd assemblies
+            jq -r 'to_entries[] | "\(.value)  \(.key)"' manifest.sha256.json | sha256sum -c -
+          )
+          echo "✅ All hashes match."
+
+      - name: Validate this is not a version downgrade
+        run: |
+          set -euo pipefail
+          NEW_VER=$(sed -n 's:.*<version>\(.*\)</version>.*:\1:p' "$NUSPEC" | head -n1)
+          echo "PR version: $NEW_VER"
+          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.ref }}" >/dev/null 2>&1 || true
+          BASE_NUSPEC=$(git show "origin/${{ github.event.pull_request.base.ref }}:$NUSPEC" 2>/dev/null || echo "")
+          if [ -z "$BASE_NUSPEC" ]; then
+            echo "No baseline nuspec on '${{ github.event.pull_request.base.ref }}' — skipping the check."
+            exit 0
+          fi
+          OLD_VER=$(printf '%s' "$BASE_NUSPEC" | sed -n 's:.*<version>\(.*\)</version>.*:\1:p' | head -n1)
+          echo "Base version: $OLD_VER"
+          if [ "$OLD_VER" = "$NEW_VER" ]; then
+            echo "::warning::Version unchanged ($NEW_VER); the publish step would fail on a duplicate by design."
+          elif [ "$(printf '%s\n%s\n' "$OLD_VER" "$NEW_VER" | sort -V | tail -n1)" = "$NEW_VER" ]; then
+            echo "✅ Newer version: $OLD_VER -> $NEW_VER."
+          else
+            echo "::error::Version went backwards ($OLD_VER -> $NEW_VER)."
+            exit 1
+          fi
+
+      # Auto-merge for the trusted bot's PRs when opted in: GITHUB_TOKEN approves,
+      # PAT enables the merge (it can merge to a protected base).
+      - name: Auto-approve PR
+        if: success() && env.ALLOW_AUTO_MERGE_REDIST_PR == 'true' && github.event.pull_request.user.login == 'rocketmodfixadmin'
+        uses: hmarr/auto-approve-action@f0939ea97e9205ef24d872e76833fa908a770363 # v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request-number: ${{ github.event.pull_request.number }}
+          review-message: "All checks passed (files, hashes, version). Auto-approved automated PR."
+
+      - name: Enable PR automerge
+        if: success() && env.ALLOW_AUTO_MERGE_REDIST_PR == 'true' && github.event.pull_request.user.login == 'rocketmodfixadmin'
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh pr merge "$PR_NUMBER" --repo "$REPO" --squash --auto
+          echo "Auto-merge enabled for PR #${PR_NUMBER}."

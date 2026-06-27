@@ -1,0 +1,32 @@
+name: "Redist Cleanup"
+
+on:
+  pull_request:
+    types:
+      - closed
+
+jobs:
+  cleanup-redist-branch:
+    name: "Cleanup Redist Branch"
+    if: >
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'redist-update/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Lock PR conversation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr lock "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --reason resolved || true
+
+      # Only delete the branch after a successful merge (never for a closed-unmerged PR).
+      - name: Delete merged PR branch
+        if: github.event.pull_request.merged == true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$BRANCH_NAME" || true

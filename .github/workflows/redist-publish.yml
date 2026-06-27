@@ -1,0 +1,69 @@
+name: "Redist Publish"
+
+# Publishes whatever is on master once a redist-update PR merges (the nuspec version
+# was already bumped in that PR). nuget.org via OIDC Trusted Publishing; GitHub Packages
+# as a best-effort mirror.
+#
+# NOTE: the nuget.org Trusted Publishing policy's "Workflow" field must be
+# `redist-publish.yml` (this file), and Package owner must be `sunnamed434`
+# (the holder of the RocketModFix. prefix reservation).
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'assemblies/**'
+      - '*.nuspec'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ldm-redist-publish
+  cancel-in-progress: false
+
+env:
+  NUSPEC: "RocketModFix.LDM.Redist.nuspec"
+
+jobs:
+  publish:
+    name: "Publish to NuGet"
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write   # OIDC Trusted Publishing
+      packages: write   # best-effort GitHub Packages mirror
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup NuGet
+        uses: nuget/setup-nuget@fd55a6f3b34392fa83fde1454582407d8c714123 # v4
+
+      # Exchange the GitHub OIDC token for a ~1h NuGet key, right before push.
+      - name: NuGet login (OIDC -> temp API key)
+        id: nuget-login
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: NuGet Pack & Push
+        uses: ./.github/actions/nuget-pack
+        with:
+          nuspec_path: ${{ env.NUSPEC }}
+          nuget_key: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+          nuget_push: true
+
+      # Best-effort mirror to GitHub Packages; nuget.org above is the primary. Its NuGet
+      # feed needs auth even to restore, so this is a backup, not the main source.
+      - name: Mirror to GitHub Packages
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          dotnet nuget push *.nupkg \
+            --source "https://nuget.pkg.github.com/${OWNER}/index.json" \
+            --api-key "$GH_TOKEN" --skip-duplicate

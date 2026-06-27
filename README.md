@@ -31,7 +31,7 @@ The package version is the **Rocket version** (e.g. `4.9.3.18`), read from `Rock
 
 ## How it works
 
-A scheduled GitHub Actions job pulls just the `Extras/Rocket.Unturned` assemblies from the Unturned dedicated server's content depot (DepotDownloader, anonymous), reads the Rocket version, and — only if it's newer than the published one — packs and pushes to NuGet via OIDC Trusted Publishing. No external servers, no stored API keys.
+Everything runs on GitHub Actions — no external servers. A scheduled job pulls just the `Extras/Rocket.Unturned` assemblies from the dedicated server's content depot (DepotDownloader, anonymous). When the Rocket version changes it **opens a PR**; `redist-verify` checks the files, SHA-256 hashes and that the version isn't a downgrade; on merge `redist-publish` packs and pushes to **NuGet** (OIDC Trusted Publishing) plus a **GitHub Packages** mirror. No stored API keys.
 
 ## License
 

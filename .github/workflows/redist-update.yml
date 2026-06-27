@@ -1,9 +1,9 @@
-name: "Update and Publish"
+name: "Redist Update"
 
-# Redistributes the official Rocket (Legally Distinct Missile) assemblies that ship
-# inside the Unturned dedicated server's Extras/Rocket.Unturned. Pulls just those few
-# files from the content depot, versions by Rocket's own version (Rocket.Unturned.module),
-# and publishes to NuGet only when Rocket actually changes. See README / ARCHITECTURE.
+# Scheduled: fetch the official Rocket (LDM) assemblies from the Unturned dedicated
+# server's Extras/Rocket.Unturned and, when the Rocket version changed, open a PR.
+# Never commits to master directly — redist-verify validates it, redist-publish
+# publishes on merge. Mirrors RocketModFix.Unturned.Redist's flow (1 variant here).
 
 on:
   schedule:
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Re-publish even if the Rocket version is unchanged"
+        description: "Open a PR even if the Rocket version is unchanged"
         type: boolean
         default: false
 
@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ldm-redist
+  group: ldm-redist-update
   cancel-in-progress: false
 
 env:
@@ -27,15 +27,15 @@ env:
   CONTENT_DEPOT: "1110393"   # content depot holding Extras/Rocket.Unturned
   ROCKET_DIR: "download/Extras/Rocket.Unturned"
   NUSPEC: "RocketModFix.LDM.Redist.nuspec"
+  PR_BRANCH: "redist-update/ldm"
 
 jobs:
   update:
-    name: "Update & publish"
+    name: "Update LDM redist"
     runs-on: ubuntu-22.04
     permissions:
-      contents: write   # commit the refreshed assemblies + nuspec
-      id-token: write   # OIDC Trusted Publishing
-      packages: write   # best-effort GitHub Packages mirror
+      contents: write        # peter-evans needs it to push the branch
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -59,10 +59,9 @@ jobs:
             'Extras/Rocket.Unturned/Rocket.Unturned.dll' \
             'Extras/Rocket.Unturned/Rocket.Unturned.module' > rocket_filelist.txt
 
-          # Anonymous login works for the dedicated-server depots. steamcmd can't fetch a
-          # file subset (whole-depot only), so DepotDownloader -filelist is the right tool;
-          # these are MIT (LDM) assemblies with public source. DepotDownloader can drop its
-          # connection mid-run (a known transient), so retry and gate on the real artifacts.
+          # Anonymous works for the dedicated-server depots. steamcmd can't fetch a
+          # file subset, so DepotDownloader -filelist is the right tool here; the DLLs
+          # are MIT (LDM) with public source. Retry: DepotDownloader can drop mid-run.
           ok=false
           for i in 1 2 3 4; do
             rm -rf download
@@ -78,11 +77,11 @@ jobs:
             [ "$i" -lt 4 ] && sleep $((i * 15))
           done
           if [ "$ok" != "true" ]; then
-            echo "::error::Could not fetch the Rocket assemblies after 4 attempts (Steam/anonymous outage or depot layout change?)."
+            echo "::error::Could not fetch the Rocket assemblies after 4 attempts."
             exit 1
           fi
 
-      - name: Resolve version and decide whether to publish
+      - name: Resolve version and decide whether to open a PR
         id: decide
         env:
           FORCE: ${{ github.event.inputs.force }}
@@ -94,24 +93,24 @@ jobs:
             exit 1
           fi
           old=$(sed -n 's:.*<version>\(.*\)</version>.*:\1:p' "$NUSPEC" | head -n1)
-          echo "Published: ${old:-<none>}  |  Upstream Rocket: $new"
+          echo "On master: ${old:-<none>}  |  Upstream Rocket: $new"
 
-          publish=false
+          open=false
           if [ "${FORCE:-false}" = "true" ]; then
-            publish=true
+            open=true
           elif [ "$old" = "$new" ]; then
-            echo "Rocket unchanged — nothing to publish."
+            echo "Rocket unchanged — no PR."
           elif [ "$(printf '%s\n%s\n' "$old" "$new" | sort -V | tail -n1)" = "$new" ]; then
-            publish=true
+            open=true
           else
-            echo "::error::Upstream Rocket version ($new) is older than the published one ($old); refusing to downgrade."
+            echo "::error::Upstream Rocket version ($new) is older than the one on master ($old); refusing to downgrade."
             exit 1
           fi
           echo "version=$new" >> "$GITHUB_OUTPUT"
-          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "open=$open" >> "$GITHUB_OUTPUT"
 
-      - name: Stage assemblies and version
-        if: steps.decide.outputs.publish == 'true'
+      - name: Stage assemblies, version and hash manifest
+        if: steps.decide.outputs.open == 'true'
         env:
           VERSION: ${{ steps.decide.outputs.version }}
         run: |
@@ -120,66 +119,40 @@ jobs:
           rm -f assemblies/*.dll
           cp "$ROCKET_DIR"/Rocket.API.dll "$ROCKET_DIR"/Rocket.Core.dll "$ROCKET_DIR"/Rocket.Unturned.dll assemblies/
           sed -i "s|<version>[^<]*</version>|<version>${VERSION}</version>|" "$NUSPEC"
+          # Integrity manifest redist-verify checks before merge.
+          python3 - <<'PY'
+          import hashlib, json, glob, os
+          m = {os.path.basename(f): hashlib.sha256(open(f,'rb').read()).hexdigest()
+               for f in sorted(glob.glob("assemblies/*.dll"))}
+          json.dump(m, open("assemblies/manifest.sha256.json","w"), indent=2)
+          PY
 
-      - name: Setup NuGet
-        if: steps.decide.outputs.publish == 'true'
-        uses: nuget/setup-nuget@fd55a6f3b34392fa83fde1454582407d8c714123 # v4
-
-      # Exchange the GitHub OIDC token for a ~1h NuGet key, right before push.
-      - name: NuGet login (OIDC -> temp API key)
-        if: steps.decide.outputs.publish == 'true'
-        id: nuget-login
-        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1
+      # Created with PAT (not GITHUB_TOKEN) so the PR triggers redist-verify, and so
+      # the bot author gates auto-merge there. Mirrors the Unturned Redist.
+      - name: Create Pull Request
+        if: steps.decide.outputs.open == 'true'
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
         with:
-          user: ${{ secrets.NUGET_USER }}
+          token: ${{ secrets.PAT }}
+          branch: ${{ env.PR_BRANCH }}
+          delete-branch: true
+          base: master
+          add-paths: |
+            assemblies/**
+            ${{ env.NUSPEC }}
+          commit-message: "Update to Rocket ${{ steps.decide.outputs.version }}"
+          title: "🤖 Update to Rocket ${{ steps.decide.outputs.version }}"
+          committer: rocketmodfixadmin <rocketmodfixadmin@users.noreply.github.com>
+          author: rocketmodfixadmin <rocketmodfixadmin@users.noreply.github.com>
+          body: |
+            Automated update of the official Rocket (LDM) assemblies to **${{ steps.decide.outputs.version }}**.
 
-      - name: NuGet Pack & Push
-        if: steps.decide.outputs.publish == 'true'
-        uses: ./.github/actions/nuget-pack
-        with:
-          nuspec_path: ${{ env.NUSPEC }}
-          nuget_key: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
-          nuget_push: true
+            Validation (files, SHA-256 hashes, no version downgrade) runs on this PR via `redist-verify`. On merge, `redist-publish` pushes to NuGet + GitHub Packages.
+          labels: |
+            automated
+            redist-update
 
-      # Best-effort mirror to GitHub Packages; nuget.org above is the primary. Its NuGet
-      # feed needs auth even to restore, so this is a backup, not the main source.
-      - name: Mirror to GitHub Packages
-        if: steps.decide.outputs.publish == 'true'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OWNER: ${{ github.repository_owner }}
-        run: |
-          set -euo pipefail
-          dotnet nuget push *.nupkg \
-            --source "https://nuget.pkg.github.com/${OWNER}/index.json" \
-            --api-key "$GH_TOKEN" --skip-duplicate
-
-      # Record what we published AFTER the push succeeds: if the push fails the repo
-      # stays unchanged and the next run retries; a duplicate would fail loudly.
-      - name: Commit published version
-        if: steps.decide.outputs.publish == 'true'
-        env:
-          VERSION: ${{ steps.decide.outputs.version }}
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add assemblies "$NUSPEC"
-          git commit -m "Update to Rocket ${VERSION}"
-          git push
-
-      - name: Summary
-        if: always()
-        run: |
-          {
-            echo "## LDM redist"
-            echo "- **Published version**: ${{ steps.decide.outputs.version || 'n/a' }}"
-            echo "- **Published this run**: ${{ steps.decide.outputs.publish || 'false' }}"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # On any scheduled-run failure, open (or comment on) a tracking issue so breakage
-  # isn't silent.
+  # On any scheduled-run failure, open (or comment on) a tracking issue.
   notify-failure:
     name: "Notify on failure"
     needs: update
@@ -197,7 +170,7 @@ jobs:
         run: |
           set -euo pipefail
           marker="LDM redist update workflow failed"
-          body=$(printf '⚠️ The scheduled LDM redist update failed.\n\nRun: %s\n\nA Steam fetch (DepotDownloader) or the NuGet publish errored. Check the run for the failing step.' "$RUN_URL")
+          body=$(printf '⚠️ The scheduled LDM redist update failed.\n\nRun: %s\n\nA Steam fetch (DepotDownloader) or the PR creation errored. Check the run for the failing step.' "$RUN_URL")
           gh label create update-failure --repo "$REPO" --color B60205 --description "Automated LDM redist update failure" --force >/dev/null 2>&1 || true
           existing=$(gh issue list --repo "$REPO" --state open --search "in:title \"$marker\"" --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
@@ -209,9 +182,6 @@ jobs:
   workflow-keepalive:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    # Re-enable this scheduled workflow (GitHub disables them after 60 days idle).
-    # continue-on-error: the default token occasionally 401s here; keepalive is
-    # non-critical and self-healing, so a blip must not redden the run.
     continue-on-error: true
     permissions:
       actions: write
@@ -221,7 +191,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # GITHUB_WORKFLOW_REF is "<owner>/<repo>/.github/workflows/<file>@<ref>".
           case "${GITHUB_WORKFLOW_REF:?}" in
             "${GITHUB_REPOSITORY:?}"/.github/workflows/*.y*ml@*) ;;
             *) echo "::error::Unexpected GITHUB_WORKFLOW_REF: ${GITHUB_WORKFLOW_REF}"; exit 1 ;;
