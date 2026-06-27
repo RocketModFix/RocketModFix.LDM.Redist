@@ -1,0 +1,37 @@
+name: 'NuGet Pack'
+description: 'Packs (and optionally pushes) a RocketModFix NuGet package from a .nuspec'
+inputs:
+  nuspec_path:
+    description: 'Path to .nuspec'
+    required: true
+  nuget_push:
+    description: 'Push to NuGet?'
+    required: false
+    default: 'false'
+  nuget_key:
+    description: 'NuGet API key (short-lived key from NuGet/login OIDC exchange)'
+    required: false
+runs:
+  using: "composite"
+  steps:
+    - name: Pack
+      shell: bash
+      env:
+        NUSPEC_PATH: ${{ inputs.nuspec_path }}
+      run: |
+        set -euo pipefail
+        nuget pack "$NUSPEC_PATH"
+    - name: Push to NuGet
+      shell: bash
+      env:
+        NUGET_PUSH: ${{ inputs.nuget_push }}
+        NUGET_KEY: ${{ inputs.nuget_key }}
+      run: |
+        set -euo pipefail
+        if [ "$NUGET_PUSH" != "true" ]; then
+          echo "nuget_push is '$NUGET_PUSH' (not 'true') — skipping push."
+          exit 0
+        fi
+        # No --skip-duplicate by design: a duplicate version means something
+        # upstream went wrong, and the publish should fail loudly.
+        dotnet nuget push *.nupkg --api-key "$NUGET_KEY" --source https://api.nuget.org/v3/index.json

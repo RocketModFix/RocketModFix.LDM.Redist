@@ -1,0 +1,216 @@
+name: "Update and Publish"
+
+# Redistributes the official Rocket (Legally Distinct Missile) assemblies that ship
+# inside the Unturned dedicated server's Extras/Rocket.Unturned. Pulls just those few
+# files from the content depot, versions by Rocket's own version (Rocket.Unturned.module),
+# and publishes to NuGet only when Rocket actually changes. See README / ARCHITECTURE.
+
+on:
+  schedule:
+    - cron: "0 * * * *"  # hourly; LDM changes a few times a year, so most runs are a no-op
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Re-publish even if the Rocket version is unchanged"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ldm-redist
+  cancel-in-progress: false
+
+env:
+  APP_ID: "1110390"          # Unturned Dedicated Server
+  CONTENT_DEPOT: "1110393"   # content depot holding Extras/Rocket.Unturned
+  ROCKET_DIR: "download/Extras/Rocket.Unturned"
+  NUSPEC: "RocketModFix.LDM.Redist.nuspec"
+
+jobs:
+  update:
+    name: "Update & publish"
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write   # commit the refreshed assemblies + nuspec
+      id-token: write   # OIDC Trusted Publishing
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download DepotDownloader
+        uses: robinraju/release-downloader@28fc21f50d76778e7023361aa1f863e717d3d56f # v1
+        with:
+          repository: SteamRE/DepotDownloader
+          tag: "DepotDownloader_3.4.0" # Pin its version to avoid breaking changes.
+          fileName: DepotDownloader-linux-x64.zip
+          out-file-path: depot_downloader
+          extract: true
+
+      - name: Fetch Rocket assemblies from Steam
+        run: |
+          set -euo pipefail
+          chmod +x depot_downloader/DepotDownloader
+          printf '%s\n' \
+            'Extras/Rocket.Unturned/Rocket.API.dll' \
+            'Extras/Rocket.Unturned/Rocket.Core.dll' \
+            'Extras/Rocket.Unturned/Rocket.Unturned.dll' \
+            'Extras/Rocket.Unturned/Rocket.Unturned.module' > rocket_filelist.txt
+
+          # Anonymous login works for the dedicated-server depots. steamcmd can't fetch a
+          # file subset (whole-depot only), so DepotDownloader -filelist is the right tool;
+          # these are MIT (LDM) assemblies with public source. DepotDownloader can drop its
+          # connection mid-run (a known transient), so retry and gate on the real artifacts.
+          ok=false
+          for i in 1 2 3 4; do
+            rm -rf download
+            if depot_downloader/DepotDownloader -app "$APP_ID" -depot "$CONTENT_DEPOT" \
+                 -os linux -dir download -filelist rocket_filelist.txt \
+               && [ -f "$ROCKET_DIR/Rocket.Unturned.module" ] \
+               && [ -f "$ROCKET_DIR/Rocket.Core.dll" ] \
+               && [ -f "$ROCKET_DIR/Rocket.API.dll" ] \
+               && [ -f "$ROCKET_DIR/Rocket.Unturned.dll" ]; then
+              ok=true; break
+            fi
+            echo "::warning::DepotDownloader attempt ${i}/4 did not produce the Rocket files (likely a transient Steam drop); retrying after backoff..."
+            [ "$i" -lt 4 ] && sleep $((i * 15))
+          done
+          if [ "$ok" != "true" ]; then
+            echo "::error::Could not fetch the Rocket assemblies after 4 attempts (Steam/anonymous outage or depot layout change?)."
+            exit 1
+          fi
+
+      - name: Resolve version and decide whether to publish
+        id: decide
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          new=$(jq -r '.Version' "$ROCKET_DIR/Rocket.Unturned.module")
+          if [ -z "$new" ] || [ "$new" = "null" ]; then
+            echo "::error::Could not read .Version from Rocket.Unturned.module."
+            exit 1
+          fi
+          old=$(sed -n 's:.*<version>\(.*\)</version>.*:\1:p' "$NUSPEC" | head -n1)
+          echo "Published: ${old:-<none>}  |  Upstream Rocket: $new"
+
+          publish=false
+          if [ "${FORCE:-false}" = "true" ]; then
+            publish=true
+          elif [ "$old" = "$new" ]; then
+            echo "Rocket unchanged — nothing to publish."
+          elif [ "$(printf '%s\n%s\n' "$old" "$new" | sort -V | tail -n1)" = "$new" ]; then
+            publish=true
+          else
+            echo "::error::Upstream Rocket version ($new) is older than the published one ($old); refusing to downgrade."
+            exit 1
+          fi
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+      - name: Stage assemblies and version
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.decide.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p assemblies
+          rm -f assemblies/*.dll
+          cp "$ROCKET_DIR"/Rocket.API.dll "$ROCKET_DIR"/Rocket.Core.dll "$ROCKET_DIR"/Rocket.Unturned.dll assemblies/
+          sed -i "s|<version>[^<]*</version>|<version>${VERSION}</version>|" "$NUSPEC"
+
+      - name: Setup NuGet
+        if: steps.decide.outputs.publish == 'true'
+        uses: nuget/setup-nuget@fd55a6f3b34392fa83fde1454582407d8c714123 # v4
+
+      # Exchange the GitHub OIDC token for a ~1h NuGet key, right before push.
+      - name: NuGet login (OIDC -> temp API key)
+        if: steps.decide.outputs.publish == 'true'
+        id: nuget-login
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1
+        with:
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: NuGet Pack & Push
+        if: steps.decide.outputs.publish == 'true'
+        uses: ./.github/actions/nuget-pack
+        with:
+          nuspec_path: ${{ env.NUSPEC }}
+          nuget_key: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+          nuget_push: true
+
+      # Record what we published AFTER the push succeeds: if the push fails the repo
+      # stays unchanged and the next run retries; a duplicate would fail loudly.
+      - name: Commit published version
+        if: steps.decide.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.decide.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add assemblies "$NUSPEC"
+          git commit -m "Update to Rocket ${VERSION}"
+          git push
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## LDM redist"
+            echo "- **Published version**: ${{ steps.decide.outputs.version || 'n/a' }}"
+            echo "- **Published this run**: ${{ steps.decide.outputs.publish || 'false' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # On any scheduled-run failure, open (or comment on) a tracking issue so breakage
+  # isn't silent.
+  notify-failure:
+    name: "Notify on failure"
+    needs: update
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          marker="LDM redist update workflow failed"
+          body=$(printf '⚠️ The scheduled LDM redist update failed.\n\nRun: %s\n\nA Steam fetch (DepotDownloader) or the NuGet publish errored. Check the run for the failing step.' "$RUN_URL")
+          gh label create update-failure --repo "$REPO" --color B60205 --description "Automated LDM redist update failure" --force >/dev/null 2>&1 || true
+          existing=$(gh issue list --repo "$REPO" --state open --search "in:title \"$marker\"" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "⚠️ $marker" --body "$body" --label update-failure
+          fi
+
+  workflow-keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    # Re-enable this scheduled workflow (GitHub disables them after 60 days idle).
+    # continue-on-error: the default token occasionally 401s here; keepalive is
+    # non-critical and self-healing, so a blip must not redden the run.
+    continue-on-error: true
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this scheduled workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # GITHUB_WORKFLOW_REF is "<owner>/<repo>/.github/workflows/<file>@<ref>".
+          case "${GITHUB_WORKFLOW_REF:?}" in
+            "${GITHUB_REPOSITORY:?}"/.github/workflows/*.y*ml@*) ;;
+            *) echo "::error::Unexpected GITHUB_WORKFLOW_REF: ${GITHUB_WORKFLOW_REF}"; exit 1 ;;
+          esac
+          workflow="${GITHUB_WORKFLOW_REF%%@*}"
+          workflow="${workflow#"${GITHUB_REPOSITORY}"/.github/workflows/}"
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/enable"

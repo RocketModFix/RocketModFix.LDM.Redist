@@ -1,0 +1,26 @@
+# The update workflow downloads into the tree, so ignore everything by default and
+# allowlist exactly what we track. A stray download/ or *.nupkg can never be committed.
+# NOTE: new root files are ignored until you add a matching "!..." line below.
+
+# Ignore all files
+*
+
+# Allow tracking of the files/dirs we maintain
+!.gitignore
+!.gitattributes
+!*/
+!.gitkeep
+!.github/**
+!README.md
+!LICENSE
+!icon.png
+!RocketModFix.LDM.Redist.nuspec
+
+# The redistributed Rocket assemblies (committed by the workflow on each update)
+!/assemblies/**
+
+# Never commit Steam downloads or build output
+/download/
+/depot_downloader/
+rocket_filelist.txt
+*.nupkg

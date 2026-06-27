@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd">
+  <metadata>
+    <id>RocketModFix.LDM.Redist</id>
+    <version>0.0.0</version>
+    <title>Official Rocket (LDM) Redistributable</title>
+    <description>
+      The official Rocket (Legally Distinct Missile) assemblies — Rocket.API, Rocket.Core, Rocket.Unturned — for Unturned plugin development. Standalone and always up-to-date. Zero dependencies by design: bring your own Unturned redist (Assembly-CSharp, Steamworks.NET, SDG.NetTransport) and UnityEngine redist.
+    </description>
+    <authors>SmartlyDressedGames;RocketModFix</authors>
+    <icon>icon.png</icon>
+    <license type="file">LICENSE</license>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <projectUrl>https://github.com/RocketModFix/RocketModFix.LDM.Redist</projectUrl>
+    <repository type="git" url="https://github.com/RocketModFix/RocketModFix.LDM.Redist" />
+    <readme>README.md</readme>
+    <tags>unturned rocket rocketmod ldm legally-distinct-missile redist plugin openmod</tags>
+  </metadata>
+  <files>
+    <!-- Common files for all frameworks -->
+    <file src="LICENSE" target="LICENSE" />
+    <file src="README.md" target="README.md" />
+
+    <!-- The three Rocket assemblies, offered under each TFM a plugin might target.
+         They are compile-time references only; at runtime the plugin loads against
+         the server's own Rocket.*.dll. -->
+    <file src="assemblies/*.dll" target="lib/net40" />
+    <file src="assemblies/*.dll" target="lib/net48" />
+    <file src="assemblies/*.dll" target="lib/netstandard2.0" />
+    <file src="assemblies/*.dll" target="lib/netstandard2.1" />
+
+    <file src="icon.png" target="icon.png" />
+  </files>
+</package>
